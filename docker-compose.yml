@@ -1,0 +1,50 @@
+# Full local stack: the agentic RAG API + an Ollama model server.
+#
+#   docker compose up --build
+#   open http://localhost:8000
+#
+# Set RAG_OFFLINE=1 to skip Ollama (deterministic offline backend).
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    command: >
+      "ollama pull ${RAG_LLM_MODEL:-llama3.2} && ollama pull ${RAG_EMBED_MODEL:-nomic-embed-text}"
+    restart: "no"
+
+  api:
+    build: .
+    image: agentic-rag-voyage
+    ports:
+      - "8000:8000"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - RAG_LLM_MODEL=${RAG_LLM_MODEL:-llama3.2}
+      - RAG_EMBED_MODEL=${RAG_EMBED_MODEL:-nomic-embed-text}
+      - RAG_OFFLINE=${RAG_OFFLINE:-0}
+      - RAG_MAX_SUBQUERIES=${RAG_MAX_SUBQUERIES:-3}
+      - RAG_MAX_STEPS=${RAG_MAX_STEPS:-4}
+
+volumes:
+  ollama:
