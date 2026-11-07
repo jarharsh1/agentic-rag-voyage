@@ -1,4 +1,4 @@
-"""End-to-end: ingest voyage records via the API and run the agentic loop."""
+"""End-to-end: ingest the sample knowledge base via the API and run the agentic loop."""
 
 from pathlib import Path
 
@@ -16,14 +16,14 @@ def test_health_offline():
 
 
 def test_ingest_then_agentic_ask():
-    doc = Path("data/voyage_records.md").read_text(encoding="utf-8")
-    r = client.post("/ingest", json={"text": doc, "source": "voyage_records.md"})
+    doc = Path("data/sample_knowledge_base.md").read_text(encoding="utf-8")
+    r = client.post("/ingest", json={"text": doc, "source": "kb.md"})
     assert r.status_code == 200
     assert r.json()["chunks_added"] >= 3
 
     r = client.post(
         "/ask",
-        json={"question": "Why was the Jeddah call delayed and what was the demurrage impact?"},
+        json={"question": "How long do I have to request a refund and how is it issued?"},
     )
     assert r.status_code == 200
     body = r.json()
@@ -31,6 +31,11 @@ def test_ingest_then_agentic_ask():
     assert body["trace"]["subqueries"]
     assert len(body["trace"]["subqueries"]) >= 2
     assert body["sources"]
-    # The answer should surface the congestion delay and/or the demurrage figure.
+    # The answer should surface the refund window and/or how refunds are issued.
     low = body["answer"].lower()
-    assert "congestion" in low or "150,000" in body["answer"] or "demurrage" in low
+    assert "30 days" in low or "30" in body["answer"] or "refund" in low
+
+
+def test_index_and_static_served():
+    assert "Agentic RAG Engine" in client.get("/").text
+    assert "/ask" in client.get("/static/app.js").text
