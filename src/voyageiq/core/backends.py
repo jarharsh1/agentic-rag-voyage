@@ -1,8 +1,9 @@
 """Pluggable embedding + LLM backends (Ollama-first, deterministic offline).
 
-Same maritime-RAG pattern as the sibling repos, with two extra offline
-capabilities the agentic loop needs: planning sub-queries and a grounding
-check. Both are deterministic so the agent is fully testable without a model.
+Domain-agnostic: the same backends power the agentic loop over any corpus,
+with two extra offline capabilities the loop needs — planning sub-queries and
+a grounding check. Both are deterministic so the agent is fully testable
+without a model server.
 """
 
 from __future__ import annotations
