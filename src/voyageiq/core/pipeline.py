@@ -24,3 +24,8 @@ class VoyagePipeline:
 
     def ask(self, question: str) -> dict:
         return self.agent.answer(question)
+
+    def reset(self) -> None:
+        """Drop all ingested records. The shared in-process store is otherwise
+        append-only, so this lets callers reclaim it between corpora/sessions."""
+        self.store.clear()

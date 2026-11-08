@@ -35,4 +35,10 @@ class VectorStore:
     def search(self, query_embedding: list[float], top_k: int) -> list[tuple[Record, float]]:
         scored = [(r, cosine(query_embedding, r.embedding)) for r in self._records]
         scored.sort(key=lambda t: t[1], reverse=True)
+        # Drop clean-zero scores (no shared dimensions at all). This does NOT
+        # remove the offline hashed embedder's collision noise floor; callers
+        # that need true relevance apply a lexical-overlap check on top.
         return [(r, s) for r, s in scored[:top_k] if s > 0]
+
+    def clear(self) -> None:
+        self._records.clear()

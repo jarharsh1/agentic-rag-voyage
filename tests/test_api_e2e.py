@@ -39,3 +39,12 @@ def test_ingest_then_agentic_ask():
 def test_index_and_static_served():
     assert "Agentic RAG Engine" in client.get("/").text
     assert "/ask" in client.get("/static/app.js").text
+
+
+def test_reset_clears_the_shared_corpus():
+    client.post("/ingest", json={"text": "Bunker fuel was loaded at Rotterdam.", "source": "x"})
+    assert client.get("/health").json()["indexed_chunks"] > 0
+    r = client.post("/reset")
+    assert r.status_code == 200
+    assert r.json()["indexed_chunks"] == 0
+    assert client.get("/health").json()["indexed_chunks"] == 0
