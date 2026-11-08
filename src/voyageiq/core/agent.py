@@ -74,6 +74,23 @@ def grounding_score(answer: str, evidence: list[str]) -> float:
     return len(ans_kw & ev_kw) / len(ans_kw)
 
 
+def _has_lexical_overlap(question: str, evidence: list[Record]) -> bool:
+    """True if any question content word appears in any retrieved chunk.
+
+    The offline hashed embedder collides tokens into a fixed-dimension space, so
+    cosine similarity never scores a clean zero even for unrelated text; the
+    vector store therefore always returns chunks. This guard distinguishes
+    genuinely relevant hits from that noise floor before we cite or refine.
+    """
+    q_kw = set(keywords(question))
+    if not q_kw:
+        return False
+    for rec in evidence:
+        if q_kw & set(keywords(rec.text)):
+            return True
+    return False
+
+
 @dataclass
 class AgentTrace:
     subqueries: list[str] = field(default_factory=list)
@@ -99,23 +116,43 @@ class VoyageAgent:
                     "sources": [], "trace": trace.__dict__}
 
         # 1 + 2: plan and retrieve per sub-query, pooling unique evidence.
+        # Each retrieval round counts as one agent step, so the loop as a whole
+        # is bounded by settings.max_steps (initial rounds + optional refine).
         subs = plan_subqueries(question, settings.max_subqueries)
         trace.subqueries = subs
         pooled: dict[int, tuple[Record, float]] = {}
+        steps_used = 0
         for sq in subs:
             hits = self._retrieve(sq, settings.top_k)
+            steps_used += 1
             trace.steps.append({"subquery": sq, "retrieved": [r.id for r, _ in hits]})
             for rec, score in hits:
                 if rec.id not in pooled or score > pooled[rec.id][1]:
                     pooled[rec.id] = (rec, score)
 
         evidence = [rec for rec, _ in sorted(pooled.values(), key=lambda t: t[1], reverse=True)]
+
+        # If the question shares no vocabulary with any retrieved chunk, the hits
+        # are pure embedding noise (the offline hashed embedder never scores a
+        # clean zero). Don't synthesize an answer over, refine on, or cite them:
+        # answer honestly with empty sources and an un-refined trace.
+        if not _has_lexical_overlap(question, evidence):
+            trace.grounding = 0.0
+            return {
+                "answer": "The records do not appear to answer that.",
+                "sources": [],
+                "trace": trace.__dict__,
+            }
+
         draft = self._synthesize(question, evidence)
 
-        # 4: grounding check; one refinement retrieval if weak.
+        # 4: grounding check; one refinement retrieval if weak and we still have
+        # step budget. steps_used bounds the loop by settings.max_steps for real
+        # (len(subs) alone is capped at max_subqueries and never bound it).
         trace.grounding = round(grounding_score(draft, [r.text for r in evidence]), 3)
-        if trace.grounding < 0.5 and len(subs) < settings.max_steps:
+        if trace.grounding < 0.5 and steps_used < settings.max_steps:
             trace.refined = True
+            steps_used += 1
             extra = self._retrieve(draft, settings.top_k)
             for rec, score in extra:
                 if rec.id not in pooled:
