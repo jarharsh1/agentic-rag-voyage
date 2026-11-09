@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from voyageiq.config import settings
-from voyageiq.core.backends import LLM, Embedder, keywords
+from voyageiq.core.backends import LLM, Embedder, HashingEmbedder, keywords
 from voyageiq.core.vector_store import Record, VectorStore
 
 _SYNTH_PROMPT = """You are a voyage-operations analyst. Answer the question using
@@ -74,23 +74,6 @@ def grounding_score(answer: str, evidence: list[str]) -> float:
     return len(ans_kw & ev_kw) / len(ans_kw)
 
 
-def _has_lexical_overlap(question: str, evidence: list[Record]) -> bool:
-    """True if any question content word appears in any retrieved chunk.
-
-    The offline hashed embedder collides tokens into a fixed-dimension space, so
-    cosine similarity never scores a clean zero even for unrelated text; the
-    vector store therefore always returns chunks. This guard distinguishes
-    genuinely relevant hits from that noise floor before we cite or refine.
-    """
-    q_kw = set(keywords(question))
-    if not q_kw:
-        return False
-    for rec in evidence:
-        if q_kw & set(keywords(rec.text)):
-            return True
-    return False
-
-
 @dataclass
 class AgentTrace:
     subqueries: list[str] = field(default_factory=list)
@@ -104,12 +87,45 @@ class VoyageAgent:
         self.embedder = embedder
         self.llm = llm
         self.store = store
+        # Per-answer cache of a Record's content words, so grounding, the
+        # lexical-overlap guard, and offline ordering don't re-tokenize the same
+        # chunk 2-3x. Keyed by record id; reset at the start of each answer().
+        self._kw_cache: dict[int, set[str]] = {}
 
     def _retrieve(self, query: str, k: int) -> list[tuple[Record, float]]:
         q_emb = self.embedder.embed([query])[0]
         return self.store.search(q_emb, k)
 
+    def _rec_keywords(self, rec: Record) -> set[str]:
+        kw = self._kw_cache.get(rec.id)
+        if kw is None:
+            kw = set(keywords(rec.text))
+            self._kw_cache[rec.id] = kw
+        return kw
+
+    def _order_evidence(self, question: str, pooled: dict[int, tuple[Record, float]]) -> list[Record]:
+        """Rank pooled evidence for synthesis/citation.
+
+        With a real embedder, cosine is meaningful, so keep score order. With the
+        offline hashed embedder, cosine is dominated by collision noise, so rank
+        by how many question content words each chunk actually contains (ties
+        broken by the noisy cosine) — this stops a genuinely relevant chunk from
+        being buried under noise.
+        """
+        if isinstance(self.embedder, HashingEmbedder):
+            q_kw = set(keywords(question))
+            return [
+                rec
+                for rec, _ in sorted(
+                    pooled.values(),
+                    key=lambda t: (len(q_kw & self._rec_keywords(t[0])), t[1]),
+                    reverse=True,
+                )
+            ]
+        return [rec for rec, _ in sorted(pooled.values(), key=lambda t: t[1], reverse=True)]
+
     def answer(self, question: str) -> dict:
+        self._kw_cache = {}
         trace = AgentTrace()
         if len(self.store) == 0:
             return {"answer": "No voyage records have been ingested yet.",
@@ -130,13 +146,13 @@ class VoyageAgent:
                 if rec.id not in pooled or score > pooled[rec.id][1]:
                     pooled[rec.id] = (rec, score)
 
-        evidence = [rec for rec, _ in sorted(pooled.values(), key=lambda t: t[1], reverse=True)]
+        ordered = self._order_evidence(question, pooled)
 
         # If the question shares no vocabulary with any retrieved chunk, the hits
         # are pure embedding noise (the offline hashed embedder never scores a
         # clean zero). Don't synthesize an answer over, refine on, or cite them:
         # answer honestly with empty sources and an un-refined trace.
-        if not _has_lexical_overlap(question, evidence):
+        if not self._has_overlap(question, ordered):
             trace.grounding = 0.0
             return {
                 "answer": "The records do not appear to answer that.",
@@ -144,6 +160,10 @@ class VoyageAgent:
                 "trace": trace.__dict__,
             }
 
+        # Synthesize over, ground-check against, and cite the SAME evidence set
+        # (the top_k most relevant chunks), so the citations always match the
+        # context the answer was actually built from.
+        evidence = ordered[: settings.top_k]
         draft = self._synthesize(question, evidence)
 
         # 4: grounding check; one refinement retrieval if weak and we still have
@@ -155,17 +175,25 @@ class VoyageAgent:
             steps_used += 1
             extra = self._retrieve(draft, settings.top_k)
             for rec, score in extra:
-                if rec.id not in pooled:
+                # Mirror the planning loop: keep the max score so a strongly
+                # re-retrieved chunk ranks correctly instead of keeping a stale one.
+                if rec.id not in pooled or score > pooled[rec.id][1]:
                     pooled[rec.id] = (rec, score)
-            evidence = [r for r, _ in sorted(pooled.values(), key=lambda t: t[1], reverse=True)]
+            evidence = self._order_evidence(question, pooled)[: settings.top_k]
             draft = self._synthesize(question, evidence)
             trace.grounding = round(grounding_score(draft, [r.text for r in evidence]), 3)
 
         sources = [
             {"source": rec.source, "excerpt": rec.text[:200]}
-            for rec in evidence[: settings.top_k]
+            for rec in evidence
         ]
         return {"answer": draft, "sources": sources, "trace": trace.__dict__}
+
+    def _has_overlap(self, question: str, evidence: list[Record]) -> bool:
+        q_kw = set(keywords(question))
+        if not q_kw:
+            return False
+        return any(q_kw & self._rec_keywords(rec) for rec in evidence)
 
     def _synthesize(self, question: str, evidence: list[Record]) -> str:
         context = "\n\n".join(f"[{i + 1}] {r.text}" for i, r in enumerate(evidence))

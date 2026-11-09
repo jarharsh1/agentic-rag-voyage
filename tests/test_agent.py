@@ -73,3 +73,19 @@ def test_real_question_still_cites_and_can_refine():
     result = agent.answer("How long do I have to request a refund?")
     assert result["sources"], "expected at least one citation for an answerable question"
     assert "30" in result["answer"]
+
+
+def test_sources_match_synthesized_evidence_and_rank_relevant_first():
+    # Offline, evidence is ordered by question-word overlap, not noisy cosine, so
+    # the refund chunk must be cited first. Sources must not exceed top_k and must
+    # be exactly the evidence the answer was built from (the top-k chunks).
+    from voyageiq.config import settings
+
+    agent = _agent_with_corpus()
+    result = agent.answer("How long do I have to request a refund and how is it issued?")
+    sources = result["sources"]
+    assert 0 < len(sources) <= settings.top_k
+    # The most-relevant chunk (the one mentioning refunds) is cited first.
+    assert "refund" in sources[0]["excerpt"].lower()
+    # Trace is honest: grounding is high and the answer draws on the cited chunk.
+    assert result["trace"]["grounding"] > 0.5
